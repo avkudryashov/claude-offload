@@ -97,8 +97,29 @@ offload providers
 - Input comes only from the second argument: a path, or `-` for stdin. Without it the
   instruction is the whole prompt.
 - The answer goes to stdout, `[provider model]` to stderr.
-- Exit codes: `0` ok, `1` every provider failed, `2` usage or configuration error.
+- Exit codes: `0` ok, `1` every provider failed, `2` usage or configuration error, `3`
+  secrets found in block mode.
 - Say the answer language and format in the instruction.
+
+## Redaction
+
+Before anything leaves the machine, `ask` masks secrets in the input and the instruction.
+Each match becomes `[REDACTED:<rule>]`, and stderr gets a summary such as
+`[redact] masked 2: github-pat x1, secret-assignment x1`.
+
+- Token rules follow the [gitleaks](https://github.com/gitleaks/gitleaks) default ruleset:
+  cloud, Git hosting, chat and LLM provider keys, JWTs and private keys.
+- Contextual rules catch `password=`, `token:`, `Authorization: Bearer`, passwords in URLs,
+  and high-entropy base64 strings, as detect-secrets does.
+- Placeholders, hashes under checksum or digest keys, and configuration key names are left alone.
+- If `gitleaks` is installed, its findings are masked too.
+
+```sh
+offload redact app.log                       # show what would be sent
+OFFLOAD_REDACT=block offload ask "..." app.log   # refuse instead of masking, exit 3
+```
+
+Masking is best effort. Do not send `.env` files or credential dumps.
 
 ## Routing
 
@@ -132,6 +153,9 @@ Any internal error lets the read through. `OFFLOAD_GATE=0` disables it.
 | `OFFLOAD_ENV_FILE` | | key file |
 | `OFFLOAD_<ID>_MODEL` | | model for one provider |
 | `OFFLOAD_<ID>_EXTRA` | `{}` | JSON merged into the request body |
+| `OFFLOAD_REDACT` | `redact` | `redact`, `block` or `off` |
+| `OFFLOAD_REDACT_PII` | `0` | `1` also masks emails and card numbers |
+| `OFFLOAD_GITLEAKS` | `1` | `0` skips gitleaks even when installed |
 | `OFFLOAD_GATE` | `1` | `0` disables the hook |
 | `OFFLOAD_GATE_LINES` | `800` | hook line threshold |
 | `OFFLOAD_GATE_EXT` | `log out txt` | hook extensions |
@@ -145,4 +169,4 @@ bats tests
 
 ## Licence
 
-MIT.
+MIT. Token patterns are adapted from gitleaks (MIT, Copyright (c) 2019 Zachary Rice).

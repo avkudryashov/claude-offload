@@ -274,3 +274,52 @@ body_jq() { jq -r "$1" "$OFFLOAD_TEST_LOG.body"; }
   [ "$status" -eq 2 ]
   [[ "$output" == *"cannot read"* ]]
 }
+
+# --- redaction ---
+
+@test "secrets in the input never reach the provider" {
+  scenario api.groq.com 200 "$(ok_body ok)"
+  tok="ghp_$(rnd 36)"
+  printf 'log line token %s\npassword=hunter2hunter2\n' "$tok" > "$TEST_TMP/in"
+  run --separate-stderr "$OFFLOAD" ask "Summarize" "$TEST_TMP/in"
+  [ "$status" -eq 0 ]
+  ! grep -q "$tok" "$OFFLOAD_TEST_LOG.body"
+  ! grep -q hunter2 "$OFFLOAD_TEST_LOG.body"
+  grep -q 'REDACTED:github-pat' "$OFFLOAD_TEST_LOG.body"
+  [[ "$stderr" == *"[redact] masked 2"* ]]
+}
+
+@test "secrets in the instruction are masked too" {
+  scenario api.groq.com 200 "$(ok_body ok)"
+  run "$OFFLOAD" ask "Is password=hunter2hunter2 strong?"
+  [ "$(body_jq '.messages[0].content')" = "Is password=[REDACTED:secret-assignment] strong?" ]
+}
+
+@test "OFFLOAD_REDACT=block refuses with exit 3 and sends nothing" {
+  scenario api.groq.com 200 "$(ok_body ok)"
+  printf 'password=hunter2hunter2\n' > "$TEST_TMP/in"
+  OFFLOAD_REDACT=block run "$OFFLOAD" ask "x" "$TEST_TMP/in"
+  [ "$status" -eq 3 ]
+  [[ "$output" == *"secret-assignment x1"* ]]
+  [ ! -s "$OFFLOAD_TEST_LOG" ]
+}
+
+@test "OFFLOAD_REDACT=block sends clean input" {
+  scenario api.groq.com 200 "$(ok_body ok)"
+  printf 'just a log line\n' > "$TEST_TMP/in"
+  OFFLOAD_REDACT=block run "$OFFLOAD" ask "x" "$TEST_TMP/in"
+  [ "$status" -eq 0 ]
+}
+
+@test "OFFLOAD_REDACT=off sends the input as is" {
+  scenario api.groq.com 200 "$(ok_body ok)"
+  printf 'password=hunter2hunter2\n' > "$TEST_TMP/in"
+  OFFLOAD_REDACT=off run --separate-stderr "$OFFLOAD" ask "x" "$TEST_TMP/in"
+  grep -q hunter2hunter2 "$OFFLOAD_TEST_LOG.body"
+  [[ "$stderr" != *"[redact]"* ]]
+}
+
+@test "an unknown OFFLOAD_REDACT value is a usage error" {
+  OFFLOAD_REDACT=maybe run "$OFFLOAD" ask "x"
+  [ "$status" -eq 2 ]
+}

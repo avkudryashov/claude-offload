@@ -103,3 +103,11 @@ settings() { jq -r "$1" "$HOME/.claude/settings.json"; }
   run bash "$TEST_TMP/my repo/install.sh" --uninstall
   [ "$(settings '.hooks.PreToolUse | length')" -eq 0 ]
 }
+
+@test "the installed symlink finds lib/ for redaction" {
+  run bash "$INST"
+  [ "$status" -eq 0 ]
+  run bash -c "printf 'password=hunter2hunter2' | '$HOME/.local/bin/offload' redact - 2>/dev/null"
+  [ "$status" -eq 0 ]
+  [ "$output" = "password=[REDACTED:secret-assignment]" ]
+}

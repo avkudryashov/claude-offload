@@ -45,3 +45,9 @@ teardown() { teardown_common; }
   [ "$status" -eq 0 ]
   [ -L "$HOME/.local/bin/offload" ]
 }
+
+@test "system bash runs redact" {
+  run bash -c "printf 'password=hunter2hunter2' | /bin/bash '$OFFLOAD' redact - 2>/dev/null"
+  [ "$status" -eq 0 ]
+  [ "$output" = "password=[REDACTED:secret-assignment]" ]
+}

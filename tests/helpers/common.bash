@@ -18,6 +18,7 @@ setup_common() {
   unset OFFLOAD_GROQ_MODEL OFFLOAD_NVIDIA_MODEL OFFLOAD_CEREBRAS_MODEL
   unset OFFLOAD_GROQ_EXTRA OFFLOAD_NVIDIA_EXTRA OFFLOAD_CEREBRAS_EXTRA
   unset OFFLOAD_GATE OFFLOAD_GATE_LINES OFFLOAD_GATE_EXT OFFLOAD_GATE_FUSE
+  unset OFFLOAD_REDACT OFFLOAD_REDACT_PII OFFLOAD_GITLEAKS
 }
 
 teardown_common() {
@@ -38,4 +39,10 @@ ok_body() {
 # log_hosts: the host column of the shim call log, in call order.
 log_hosts() {
   cut -d'|' -f1 "$OFFLOAD_TEST_LOG"
+}
+
+# rnd N [CHARSET]: N random characters (default [A-Za-z0-9]). Test secrets are
+# generated at runtime so no token-shaped literal is ever committed.
+rnd() {
+  LC_ALL=C tr -dc "${2:-A-Za-z0-9}" < /dev/urandom | head -c "$1"
 }

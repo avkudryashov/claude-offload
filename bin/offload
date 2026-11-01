@@ -6,12 +6,26 @@ set -euo pipefail
 OFFLOAD_VERSION=0.1.0
 PROVIDER_IDS="groq nvidia cerebras"
 
+# OFFLOAD_HOME — the checkout root, found through any symlink to this script
+# (readlink -f is not available on macOS bash 3.2 systems).
+offload_home() {
+  local src=$0 dir
+  while [ -L "$src" ]; do
+    dir=$(cd "$(dirname "$src")" && pwd)
+    src=$(readlink "$src")
+    case "$src" in /*) ;; *) src=$dir/$src ;; esac
+  done
+  cd "$(dirname "$src")/.." && pwd
+}
+OFFLOAD_HOME=$(offload_home)
+
 usage() {
   cat <<'USAGE'
 offload — offload large-input, small-output work to free LLM APIs
 
 Usage:
   offload ask [-p PROVIDER] [-m MODEL] "INSTRUCTION" [FILE|-]
+  offload redact FILE|-
   offload transcribe FILE [-- extra curl -F args, e.g. -F language=ru]
   offload doctor
   offload providers
@@ -19,6 +33,8 @@ Usage:
 
 Input for `ask` is read only from an explicit second argument: a path, or
 `-` for stdin. Output goes to stdout, the chosen provider and model to stderr.
+Secrets in the instruction and input are masked before sending
+(OFFLOAD_REDACT=redact|block|off); `offload redact` previews the result.
 USAGE
 }
 
@@ -180,6 +196,48 @@ failure_detail() {
   printf '%s' "$detail" | tr '\n' ' ' | head -c 200
 }
 
+# redact_file IN OUT — mask secrets in IN, write OUT. Uses gitleaks too when it is
+# on PATH (OFFLOAD_GITLEAKS=0 skips it). Sets REDACT_TOTAL and REDACT_SUMMARY
+# ("rule xN, ..."); never prints the secrets themselves.
+redact_file() {
+  local in=$1 out=$2 report pii=false rc=0 result
+  [ "${OFFLOAD_REDACT_PII:-0}" = 1 ] && pii=true
+  report=$(mktemp "${TMPDIR:-/tmp}/offload-gl.XXXXXX")
+  echo '[]' > "$report"
+  if [ "${OFFLOAD_GITLEAKS:-1}" != 0 ] && command -v gitleaks >/dev/null 2>&1; then
+    gitleaks stdin --no-banner --log-level error --exit-code 0 \
+      --report-format json --report-path "$report" < "$in" >/dev/null 2>&1 || rc=$?
+    if [ "$rc" -ne 0 ] || ! jq -e 'type == "array"' "$report" >/dev/null 2>&1; then
+      log "[redact] gitleaks failed (exit $rc), using built-in rules only"
+      echo '[]' > "$report"
+    fi
+  fi
+  result=$(jq -n --rawfile text "$in" --argjson pii "$pii" --slurpfile gitleaks "$report" \
+    -f "$OFFLOAD_HOME/lib/redact.jq") || { rm -f "$report"; die "redaction failed" 1; }
+  rm -f "$report"
+  printf '%s' "$result" | jq -j '.text' > "$out"
+  REDACT_TOTAL=$(printf '%s' "$result" | jq '[.counts[]] | add // 0')
+  REDACT_SUMMARY=$(printf '%s' "$result" | jq -r '.counts | to_entries | sort_by(.key) | map("\(.key) x\(.value)") | join(", ")')
+}
+
+cmd_redact() {
+  [ $# -eq 1 ] || die "usage: offload redact FILE|-"
+  local tmp
+  OFFLOAD_TMPDIR=$(mktemp -d "${TMPDIR:-/tmp}/offload.XXXXXX")
+  trap '[ -z "${OFFLOAD_TMPDIR:-}" ] || rm -rf "$OFFLOAD_TMPDIR"' EXIT
+  tmp=$OFFLOAD_TMPDIR/in
+  if [ "$1" = - ]; then
+    cat > "$tmp"
+  elif [ -f "$1" ] && [ -r "$1" ]; then
+    cat -- "$1" > "$tmp"
+  else
+    die "cannot read input file: $1"
+  fi
+  redact_file "$tmp" "$OFFLOAD_TMPDIR/out"
+  cat "$OFFLOAD_TMPDIR/out"
+  [ "$REDACT_TOTAL" -eq 0 ] || log "[redact] masked $REDACT_TOTAL: $REDACT_SUMMARY"
+}
+
 cmd_ask() {
   local opt provider="" model_override="" instruction key text
   while getopts "p:m:" opt; do
@@ -216,6 +274,25 @@ cmd_ask() {
   len=$(wc -m < "$input_file" | tr -d ' ')
   local max=${OFFLOAD_MAX_CHARS:-400000}
   [ "$len" -le "$max" ] || die "input is $len chars, limit $max: narrow it first (grep/head/tail) or raise OFFLOAD_MAX_CHARS"
+
+  local mode=${OFFLOAD_REDACT:-redact}
+  case "$mode" in
+    redact|block)
+      printf '%s' "$instruction" > "$OFFLOAD_TMPDIR/instr"
+      redact_file "$OFFLOAD_TMPDIR/instr" "$OFFLOAD_TMPDIR/instr.out"
+      local i_total=$REDACT_TOTAL i_summary=$REDACT_SUMMARY
+      redact_file "$input_file" "$OFFLOAD_TMPDIR/input.out"
+      if [ "$mode" = block ] && [ $((i_total + REDACT_TOTAL)) -gt 0 ]; then
+        die "refusing to send, secrets found: ${i_summary:+instruction: $i_summary; }${REDACT_SUMMARY:+input: $REDACT_SUMMARY}. Remove them or set OFFLOAD_REDACT=redact to mask them" 3
+      fi
+      [ "$i_total" -eq 0 ] || log "[redact] instruction: masked $i_total: $i_summary"
+      [ "$REDACT_TOTAL" -eq 0 ] || log "[redact] masked $REDACT_TOTAL: $REDACT_SUMMARY"
+      instruction=$(cat "$OFFLOAD_TMPDIR/instr.out")
+      input_file=$OFFLOAD_TMPDIR/input.out
+      ;;
+    off) ;;
+    *) die "OFFLOAD_REDACT must be redact, block or off (got: $mode)" ;;
+  esac
 
   local id order avail_fail=0
   if [ -n "$provider" ]; then
@@ -276,7 +353,7 @@ main() {
   local cmd=$1
   shift
   case "$cmd" in
-    ask|transcribe|doctor|providers) "cmd_$cmd" "$@" ;;
+    ask|redact|transcribe|doctor|providers) "cmd_$cmd" "$@" ;;
     --version|-V) echo "offload $OFFLOAD_VERSION" ;;
     -h|--help) usage ;;
     *) die "unknown subcommand: $cmd (try --help)" ;;
