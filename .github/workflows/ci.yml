@@ -1,0 +1,28 @@
+name: ci
+on:
+  push:
+  pull_request:
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install bats-core
+        run: |
+          git clone --depth 1 -b v1.11.0 https://github.com/bats-core/bats-core.git /tmp/bats-core
+          sudo /tmp/bats-core/install.sh /usr/local
+      - name: Install jq
+        run: command -v jq || sudo apt-get install -y jq
+      - name: Versions
+        run: bash --version | head -1; /bin/bash --version | head -1; jq --version; curl --version | head -1
+      - run: bats tests
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: sudo apt-get update && sudo apt-get install -y shellcheck
+      - run: shellcheck bin/offload hooks/offload-gate.sh install.sh tests/helpers/bin/curl
