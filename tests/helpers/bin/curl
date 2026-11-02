@@ -1,0 +1,68 @@
+#!/usr/bin/env bash
+# Test double for curl used by the bats suite.
+#
+# Scenario file ($OFFLOAD_TEST_SCENARIO): one request per line,
+#   HOST|HTTP_CODE|BODY|DELAY_SECONDS
+# The first line whose HOST is a substring of the URL answers the request.
+# BODY must not contain '|'. DELAY above --max-time simulates a timeout (exit 28).
+# No matching line simulates a connection failure (exit 7). HTTP_CODE "exit:N"
+# makes the shim exit with code N (e.g. exit:126 for an exec failure).
+#
+# The last -d body is written to $OFFLOAD_TEST_LOG.body.
+# Every call appends to $OFFLOAD_TEST_LOG:
+#   HOST|MODEL|USERLEN|FORMS|AUTH
+# MODEL and USERLEN come from the -d JSON body (model, length of the last
+# user message); FORMS is every -F value joined by ';'; AUTH is the
+# Authorization header value.
+set -u
+
+url="" data="" wfmt="" out="" maxtime=0 auth="" forms=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -d|--data|--data-binary|--data-raw)
+      case "$2" in @*) data=$(cat "${2#@}") ;; *) data=$2 ;; esac
+      shift 2 ;;
+    -F|--form) forms="${forms:+$forms;}$2"; shift 2 ;;
+    -w|--write-out) wfmt=$2; shift 2 ;;
+    -o|--output) out=$2; shift 2 ;;
+    --max-time|--connect-timeout) maxtime=$2; shift 2 ;;
+    -X|--request) shift 2 ;;
+    -H|--header)
+      case "$2" in Authorization:*) auth=${2#Authorization: } ;; esac
+      shift 2 ;;
+    -*) shift ;;
+    *) url=$1; shift ;;
+  esac
+done
+
+host=${url#*://}; host=${host%%/*}
+model=""; userlen=0
+if [ -n "$data" ]; then
+  model=$(printf '%s' "$data" | jq -r '.model // empty' 2>/dev/null || true)
+  userlen=$(printf '%s' "$data" | jq -r '[.messages[]? | select(.role=="user")] | last | .content | length' 2>/dev/null || echo 0)
+  [ -n "$userlen" ] && [ "$userlen" != null ] || userlen=0
+fi
+printf '%s|%s|%s|%s|%s\n' "$host" "$model" "$userlen" "$forms" "$auth" >> "${OFFLOAD_TEST_LOG:?}"
+[ -z "$data" ] || printf '%s' "$data" > "${OFFLOAD_TEST_LOG}.body"
+
+match=""
+while IFS='|' read -r s_host s_code s_body s_delay; do
+  case "$url" in *"$s_host"*) match=1; break ;; esac
+done < "${OFFLOAD_TEST_SCENARIO:?}"
+if [ -z "$match" ]; then
+  echo "curl: (7) Failed to connect to $host" >&2
+  exit 7
+fi
+
+s_delay=${s_delay:-0}
+case "$s_code" in exit:*) exit "${s_code#exit:}" ;; esac
+if [ "$maxtime" -gt 0 ] && [ "$s_delay" -gt "$maxtime" ]; then
+  sleep "$maxtime"
+  echo "curl: (28) Operation timed out after ${maxtime}000 milliseconds" >&2
+  exit 28
+fi
+[ "$s_delay" -gt 0 ] && sleep "$s_delay"
+
+[ "$out" = /dev/null ] || printf '%s' "$s_body"
+[ -z "$wfmt" ] || printf '%b' "${wfmt//%\{http_code\}/$s_code}"
+exit 0

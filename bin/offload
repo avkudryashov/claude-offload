@@ -1,0 +1,363 @@
+#!/usr/bin/env bash
+# offload — hand large-input, small-output work to free-tier LLM APIs.
+# https://github.com/avkudryashov/claude-offload
+set -euo pipefail
+
+OFFLOAD_VERSION=0.1.0
+PROVIDER_IDS="groq nvidia cerebras"
+
+# OFFLOAD_HOME — the checkout root, found through any symlink to this script
+# (readlink -f is not available on macOS bash 3.2 systems).
+offload_home() {
+  local src=$0 dir
+  while [ -L "$src" ]; do
+    dir=$(cd "$(dirname "$src")" && pwd)
+    src=$(readlink "$src")
+    case "$src" in /*) ;; *) src=$dir/$src ;; esac
+  done
+  cd "$(dirname "$src")/.." && pwd
+}
+OFFLOAD_HOME=$(offload_home)
+
+usage() {
+  cat <<'USAGE'
+offload — offload large-input, small-output work to free LLM APIs
+
+Usage:
+  offload ask [-p PROVIDER] [-m MODEL] "INSTRUCTION" [FILE|-]
+  offload redact FILE|-
+  offload transcribe FILE [-- extra curl -F args, e.g. -F language=ru]
+  offload doctor
+  offload providers
+  offload --version | --help
+
+Input for `ask` is read only from an explicit second argument: a path, or
+`-` for stdin. Output goes to stdout, the chosen provider and model to stderr.
+Secrets in the instruction and input are masked before sending
+(OFFLOAD_REDACT=redact|block|off); `offload redact` previews the result.
+USAGE
+}
+
+die() { echo "offload: $1" >&2; exit "${2:-2}"; }
+log() { echo "$1" >&2; }
+
+# provider_cfg ID — sets P_URL P_MODEL P_KEYVAR P_EXTRA; returns 1 for an unknown id.
+provider_cfg() {
+  case "$1" in
+    groq)
+      P_URL=https://api.groq.com/openai/v1
+      P_MODEL=openai/gpt-oss-120b
+      P_KEYVAR=GROQ_API_KEY
+      P_EXTRA='{}'
+      ;;
+    nvidia)
+      P_URL=https://integrate.api.nvidia.com/v1
+      P_MODEL=nvidia/nemotron-3.5-lightning-30b-a3b
+      P_KEYVAR=NVIDIA_API_KEY
+      P_EXTRA='{"chat_template_kwargs":{"enable_thinking":false}}'
+      ;;
+    cerebras)
+      P_URL=https://api.cerebras.ai/v1
+      P_MODEL=gpt-oss-120b
+      P_KEYVAR=CEREBRAS_API_KEY
+      P_EXTRA='{}'
+      ;;
+    *) return 1 ;;
+  esac
+  # OFFLOAD_<ID>_MODEL / OFFLOAD_<ID>_EXTRA override the defaults (ids are [a-z]+).
+  local up override
+  up=$(printf '%s' "$1" | tr '[:lower:]' '[:upper:]')
+  override=$(eval "printf '%s' \"\${OFFLOAD_${up}_MODEL:-}\"")
+  [ -z "$override" ] || P_MODEL=$override
+  override=$(eval "printf '%s' \"\${OFFLOAD_${up}_EXTRA:-}\"")
+  [ -z "$override" ] || P_EXTRA=$override
+}
+
+# default_providers LEN — provider order by input size: Groq is fastest but caps
+# tokens per minute, NVIDIA has no token cap.
+default_providers() {
+  if [ "$1" -le "${OFFLOAD_SMALL_LIMIT:-20000}" ]; then
+    printf '%s' "groq nvidia cerebras"
+  else
+    printf '%s' "nvidia cerebras groq"
+  fi
+}
+
+# is_availability_failure CODE — true for transport errors, timeouts, 429 and 5xx.
+# curl exit 2 (init), 126 and 127 (exec) are local problems, not provider outages.
+is_availability_failure() {
+  case "$1" in
+    curl:2|curl:126|curl:127) return 1 ;;
+    curl:*|429|5??) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+OFFLOAD_CACHE_DIR=${XDG_CACHE_HOME:-$HOME/.cache}/offload
+mark_down() { mkdir -p "$OFFLOAD_CACHE_DIR" && : > "$OFFLOAD_CACHE_DIR/down"; }
+clear_down() { rm -f "$OFFLOAD_CACHE_DIR/down"; }
+
+# env_file_path — the dotenv file keys are read from when the env var is unset.
+env_file_path() {
+  if [ -n "${OFFLOAD_ENV_FILE:-}" ]; then
+    printf '%s' "$OFFLOAD_ENV_FILE"
+  elif [ -f "$HOME/.config/offload/env" ]; then
+    printf '%s' "$HOME/.config/offload/env"
+  else
+    printf '%s' "$HOME/.env"
+  fi
+}
+
+# read_key NAME — the env var NAME if set, else the first NAME= line of the env
+# file (value after the first '=', one pair of surrounding quotes stripped).
+# The file is never sourced: it may contain lines that are not shell-safe.
+read_key() {
+  local name=$1 value file
+  value=$(eval "printf '%s' \"\${$name:-}\"")
+  if [ -z "$value" ]; then
+    file=$(env_file_path)
+    [ -r "$file" ] && value=$(grep -m1 "^$name=" "$file" | cut -d= -f2-) || value=""
+    case "$value" in
+      \"*\") value=${value#\"}; value=${value%\"} ;;
+      \'*\') value=${value#\'}; value=${value%\'} ;;
+    esac
+  fi
+  printf '%s' "$value"
+}
+
+cmd_doctor() {
+  local id key code any=0
+  for id in $PROVIDER_IDS; do
+    provider_cfg "$id"
+    key=$(read_key "$P_KEYVAR")
+    if [ -z "$key" ]; then
+      echo "$id: no key ($P_KEYVAR)"
+      continue
+    fi
+    any=1
+    code=$(curl -sS --max-time 15 -o /dev/null -w '%{http_code}' "$P_URL/models" \
+      -H "Authorization: Bearer $key" 2>/dev/null) || code="curl error"
+    echo "$id: key present ($P_KEYVAR), models HTTP $code"
+  done
+  [ "$any" -eq 1 ] || return 1
+}
+
+# build_body MODEL INSTRUCTION INPUT_FILE EXTRA — the chat-completion request body on
+# stdout. The input comes from a file (jq --rawfile), never from argv: Linux caps a
+# single argv string at 128 KiB.
+build_body() {
+  jq -cn --arg m "$1" --arg p "$2" --rawfile u "$3" --argjson x "$4" '
+    {model: $m, temperature: 0.2,
+     messages: (if $u == "" then [{role: "user", content: $p}]
+                else [{role: "system", content: $p}, {role: "user", content: $u}] end)}
+    + $x'
+}
+
+# extract_text JSON — the answer text: content, else reasoning_content, else reasoning.
+extract_text() {
+  local text
+  text=$(printf '%s' "$1" | jq -r '
+    .choices[0].message
+    | (.content // "") as $c
+    | if $c != "" then $c else (.reasoning_content // .reasoning // "") end' 2>/dev/null) || return 1
+  [ -n "$text" ] || return 1
+  printf '%s\n' "$text"
+}
+
+# call_provider URL KEY BODY_FILE — sets LAST_BODY to the response body and
+# LAST_CODE to the HTTP status, or "curl:N" on a transport error. (Globals, not
+# echo: command substitution would run in a subshell and lose LAST_CODE.)
+call_provider() {
+  local resp rc=0
+  resp=$(curl -sS --max-time "${OFFLOAD_TIMEOUT:-120}" -w '\n%{http_code}' "$1/chat/completions" \
+      -H "Authorization: Bearer $2" -H "Content-Type: application/json" \
+      --data-binary @"$3" 2>/dev/null) || rc=$?
+  if [ "$rc" -eq 0 ]; then
+    LAST_CODE=${resp##*$'\n'}
+    LAST_BODY=${resp%$'\n'*}
+  else
+    LAST_CODE="curl:$rc"
+    LAST_BODY=""
+  fi
+}
+
+# failure_detail — one line describing LAST_CODE/LAST_BODY for the stderr report.
+failure_detail() {
+  local detail
+  case "$LAST_CODE" in
+    curl:7) detail="connection failed" ;;
+    curl:28) detail="timed out after ${OFFLOAD_TIMEOUT:-120}s" ;;
+    curl:*) detail="curl exit ${LAST_CODE#curl:}" ;;
+    *)
+      detail=$(printf '%s' "$LAST_BODY" | jq -r '.error.message? // .detail? // .error? // empty' 2>/dev/null) || detail=""
+      [ -n "$detail" ] || detail=$LAST_BODY
+      ;;
+  esac
+  printf '%s' "$detail" | tr '\n' ' ' | head -c 200
+}
+
+# redact_file IN OUT — mask secrets in IN, write OUT. Uses gitleaks too when it is
+# on PATH (OFFLOAD_GITLEAKS=0 skips it). Sets REDACT_TOTAL and REDACT_SUMMARY
+# ("rule xN, ..."); never prints the secrets themselves.
+redact_file() {
+  local in=$1 out=$2 report pii=false rc=0 result
+  [ "${OFFLOAD_REDACT_PII:-0}" = 1 ] && pii=true
+  report=$(mktemp "${TMPDIR:-/tmp}/offload-gl.XXXXXX")
+  echo '[]' > "$report"
+  if [ "${OFFLOAD_GITLEAKS:-1}" != 0 ] && command -v gitleaks >/dev/null 2>&1; then
+    gitleaks stdin --no-banner --log-level error --exit-code 0 \
+      --report-format json --report-path "$report" < "$in" >/dev/null 2>&1 || rc=$?
+    if [ "$rc" -ne 0 ] || ! jq -e 'type == "array"' "$report" >/dev/null 2>&1; then
+      log "[redact] gitleaks failed (exit $rc), using built-in rules only"
+      echo '[]' > "$report"
+    fi
+  fi
+  result=$(jq -n --rawfile text "$in" --argjson pii "$pii" --slurpfile gitleaks "$report" \
+    -f "$OFFLOAD_HOME/lib/redact.jq") || { rm -f "$report"; die "redaction failed" 1; }
+  rm -f "$report"
+  printf '%s' "$result" | jq -j '.text' > "$out"
+  REDACT_TOTAL=$(printf '%s' "$result" | jq '[.counts[]] | add // 0')
+  REDACT_SUMMARY=$(printf '%s' "$result" | jq -r '.counts | to_entries | sort_by(.key) | map("\(.key) x\(.value)") | join(", ")')
+}
+
+cmd_redact() {
+  [ $# -eq 1 ] || die "usage: offload redact FILE|-"
+  local tmp
+  OFFLOAD_TMPDIR=$(mktemp -d "${TMPDIR:-/tmp}/offload.XXXXXX")
+  trap '[ -z "${OFFLOAD_TMPDIR:-}" ] || rm -rf "$OFFLOAD_TMPDIR"' EXIT
+  tmp=$OFFLOAD_TMPDIR/in
+  if [ "$1" = - ]; then
+    cat > "$tmp"
+  elif [ -f "$1" ] && [ -r "$1" ]; then
+    cat -- "$1" > "$tmp"
+  else
+    die "cannot read input file: $1"
+  fi
+  redact_file "$tmp" "$OFFLOAD_TMPDIR/out"
+  cat "$OFFLOAD_TMPDIR/out"
+  [ "$REDACT_TOTAL" -eq 0 ] || log "[redact] masked $REDACT_TOTAL: $REDACT_SUMMARY"
+}
+
+cmd_ask() {
+  local opt provider="" model_override="" instruction key text
+  while getopts "p:m:" opt; do
+    case "$opt" in
+      p) provider=$OPTARG ;;
+      m) model_override=$OPTARG ;;
+      *) usage >&2; exit 2 ;;
+    esac
+  done
+  shift $((OPTIND - 1))
+  if [ $# -lt 1 ] || [ $# -gt 2 ]; then
+    die "usage: offload ask [-p PROVIDER] [-m MODEL] \"INSTRUCTION\" [FILE|-]"
+  fi
+  [ -z "$model_override" ] || [ -n "$provider" ] || die "-m requires -p (model ids are provider-specific)"
+  instruction=$1
+
+  local input_file body_file len
+  OFFLOAD_TMPDIR=$(mktemp -d "${TMPDIR:-/tmp}/offload.XXXXXX")
+  trap '[ -z "${OFFLOAD_TMPDIR:-}" ] || rm -rf "$OFFLOAD_TMPDIR"' EXIT
+  input_file=$OFFLOAD_TMPDIR/input
+  body_file=$OFFLOAD_TMPDIR/body
+  if [ $# -eq 2 ]; then
+    if [ "$2" = - ]; then
+      cat > "$input_file"
+    else
+      if [ ! -f "$2" ] || [ ! -r "$2" ]; then
+        die "cannot read input file: $2"
+      fi
+      cat -- "$2" > "$input_file"
+    fi
+  else
+    : > "$input_file"
+  fi
+  len=$(wc -m < "$input_file" | tr -d ' ')
+  local max=${OFFLOAD_MAX_CHARS:-400000}
+  [ "$len" -le "$max" ] || die "input is $len chars, limit $max: narrow it first (grep/head/tail) or raise OFFLOAD_MAX_CHARS"
+
+  local mode=${OFFLOAD_REDACT:-redact}
+  case "$mode" in
+    redact|block)
+      printf '%s' "$instruction" > "$OFFLOAD_TMPDIR/instr"
+      redact_file "$OFFLOAD_TMPDIR/instr" "$OFFLOAD_TMPDIR/instr.out"
+      local i_total=$REDACT_TOTAL i_summary=$REDACT_SUMMARY
+      redact_file "$input_file" "$OFFLOAD_TMPDIR/input.out"
+      if [ "$mode" = block ] && [ $((i_total + REDACT_TOTAL)) -gt 0 ]; then
+        die "refusing to send, secrets found: ${i_summary:+instruction: $i_summary; }${REDACT_SUMMARY:+input: $REDACT_SUMMARY}. Remove them or set OFFLOAD_REDACT=redact to mask them" 3
+      fi
+      [ "$i_total" -eq 0 ] || log "[redact] instruction: masked $i_total: $i_summary"
+      [ "$REDACT_TOTAL" -eq 0 ] || log "[redact] masked $REDACT_TOTAL: $REDACT_SUMMARY"
+      instruction=$(cat "$OFFLOAD_TMPDIR/instr.out")
+      input_file=$OFFLOAD_TMPDIR/input.out
+      ;;
+    off) ;;
+    *) die "OFFLOAD_REDACT must be redact, block or off (got: $mode)" ;;
+  esac
+
+  local id order avail_fail=0
+  if [ -n "$provider" ]; then
+    order=$provider
+  elif [ -n "${OFFLOAD_PROVIDERS:-}" ]; then
+    order=$OFFLOAD_PROVIDERS
+  else
+    order=$(default_providers "$len")
+  fi
+  for id in $order; do
+    provider_cfg "$id" || die "unknown provider: $id (see offload providers)"
+    key=$(read_key "$P_KEYVAR")
+    [ -n "$key" ] || { log "[$id] no key ($P_KEYVAR)"; continue; }
+    build_body "${model_override:-$P_MODEL}" "$instruction" "$input_file" "$P_EXTRA" > "$body_file"
+    call_provider "$P_URL" "$key" "$body_file"
+    if [ "$LAST_CODE" = 200 ] && text=$(extract_text "$LAST_BODY"); then
+      clear_down
+      printf '%s\n' "$text"
+      log "[$id ${model_override:-$P_MODEL}]"
+      return 0
+    fi
+    is_availability_failure "$LAST_CODE" && avail_fail=1
+    log "[$id] $LAST_CODE: $(failure_detail)"
+  done
+  [ "$avail_fail" -eq 0 ] || mark_down
+  die "all providers failed" 1
+}
+
+cmd_transcribe() {
+  [ $# -ge 1 ] || die "usage: offload transcribe FILE [-- extra curl -F args]"
+  local file=$1 key resp rc=0 code body
+  shift
+  [ "${1:-}" != -- ] || shift
+  [ -r "$file" ] || die "cannot read audio file: $file"
+  key=$(read_key GROQ_API_KEY)
+  [ -n "$key" ] || die "transcription needs GROQ_API_KEY (Groq Whisper)"
+  resp=$(curl -sS --max-time "${OFFLOAD_TIMEOUT_TRANSCRIBE:-600}" -w '\n%{http_code}' \
+    https://api.groq.com/openai/v1/audio/transcriptions \
+    -H "Authorization: Bearer $key" \
+    -F "file=@$file" -F model=whisper-large-v3-turbo -F response_format=text "$@" 2>/dev/null) || rc=$?
+  [ "$rc" -eq 0 ] || die "transcription request failed (curl:$rc)" 1
+  code=${resp##*$'\n'}
+  body=${resp%$'\n'*}
+  [ "$code" = 200 ] || die "groq transcription HTTP $code: $(printf '%s' "$body" | jq -r '.error.message? // .' 2>/dev/null | tr '\n' ' ' | head -c 200)" 1
+  printf '%s\n' "$body"
+}
+
+cmd_providers() {
+  local id
+  for id in $PROVIDER_IDS; do
+    provider_cfg "$id"
+    printf '%s\t%s\t%s\t%s\n' "$id" "$P_URL" "$P_MODEL" "$P_KEYVAR"
+  done
+}
+
+main() {
+  [ $# -ge 1 ] || { usage >&2; exit 2; }
+  local cmd=$1
+  shift
+  case "$cmd" in
+    ask|redact|transcribe|doctor|providers) "cmd_$cmd" "$@" ;;
+    --version|-V) echo "offload $OFFLOAD_VERSION" ;;
+    -h|--help) usage ;;
+    *) die "unknown subcommand: $cmd (try --help)" ;;
+  esac
+}
+
+main "$@"
