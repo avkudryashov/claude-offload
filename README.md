@@ -9,6 +9,26 @@ returns a short answer, so Claude's quota goes to the decisions.
 One bash script, a Claude Code skill that says when to use it, and an optional hook that
 keeps Claude from reading huge log files directly. Requirements: bash 3.2+, curl, jq.
 
+## Install
+
+1. Install the requirements: bash 3.2+, curl and jq (`brew install jq` or `apt install jq`).
+2. Clone the repo and run the installer:
+
+   ```sh
+   git clone https://github.com/avkudryashov/claude-offload.git
+   cd claude-offload
+   ./install.sh --hook
+   ```
+
+   This links `~/.local/bin/offload`, installs the skill to `~/.claude/skills/offload/` and
+   registers the Read hook. Drop `--hook` to skip the hook.
+3. Make sure `~/.local/bin` is on your `PATH`.
+4. Register on [Groq](https://console.groq.com/keys) and [NVIDIA](https://build.nvidia.com),
+   and put the keys in `~/.config/offload/env`.
+5. Run `offload doctor` to check the setup, then restart Claude Code so it picks up the skill.
+
+To update, run `git pull` and `./install.sh --hook` again in the clone. To remove everything, run `./install.sh --uninstall`.
+
 ## How it works
 
 ![Architecture](docs/architecture.svg)
@@ -60,16 +80,6 @@ flowchart TD
     N -- no --> A
     N -- yes --> D[deny, point at offload ask]
     X[any internal error] --> A
-```
-
-## Install
-
-```sh
-git clone https://github.com/avkudryashov/claude-offload.git
-cd claude-offload
-./install.sh          # links ~/.local/bin/offload and installs the skill
-./install.sh --hook   # also registers the Read hook
-./install.sh --uninstall
 ```
 
 ## Keys
